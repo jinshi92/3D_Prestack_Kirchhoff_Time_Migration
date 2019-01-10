@@ -2,8 +2,6 @@
 /*
 Chinese Academy of Science, Guiting Chen 2019.01.010
 */
-
-
 #include "su.h"
 #include "segy.h"
 #include "header.h"
@@ -14,8 +12,6 @@ Chinese Academy of Science, Guiting Chen 2019.01.010
 #include <time.h>
 #include <cuda_runtime_api.h>
 #include <cuda.h>
-
-
 			   /* Array of shot coordinates for input traces */
 
 /****************************************************************
