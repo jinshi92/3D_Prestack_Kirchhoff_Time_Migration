@@ -1,0 +1,544 @@
+/* Prestack kirchoff time migration (2-D/3-D). */
+/*
+Chinese Academy of Science, Guiting Chen 2019.01.010
+*/
+
+
+#include "su.h"
+#include "segy.h"
+#include "header.h"
+#include "stdio.h"
+#include "stdlib.h"
+#include "math.h"
+#include <string.h>
+#include <time.h>
+#include <cuda_runtime_api.h>
+#include <cuda.h>
+
+#define BlockSize1 	16// tile size in 1st-axis
+#define BlockSize2 	16// tile size in 2nd-axis
+
+			   /* Array of shot coordinates for input traces */
+
+/**************************************************************
+*
+* Differentiation (backward second order) kernel
+*
+***************************************************************/
+
+/*
+t[gridDim.x*c_nt] - output vector of differentiated traces,
+also input
+*/
+char *sdoc[] = {
+	" 								",
+	" 3D ktmig with high performance GPU acceleration	",
+	"	Author: Guiting Chen, Chinese Academy of Science,2018.12.09	",
+	"								",
+	NULL };
+
+
+void sf_check_gpu_error(const char *msg)
+/*< check GPU errors >*/
+{
+	cudaError_t err = cudaGetLastError();
+	if (cudaSuccess != err) {
+		warn("Cuda error: %s: %s", msg, cudaGetErrorString(err));
+		exit(0);
+	}
+}
+
+
+void sf_ktmig_sbdiff(float *trace, const unsigned int nt, const float dt)
+/*< Differentiation (backward second order) >*/
+{
+	int i;
+	float val0, val1, val2;
+
+	val2 = val1 = trace[0];
+	for (i = 0; i < nt; i++) {
+		val0 = trace[i];
+		trace[i] = 0.5f*(3.0f*val0 - 4.0f*val1 + val2) / dt;
+		val2 = val1;
+		val1 = val0;
+	}
+}
+
+
+
+
+
+/****************************************************************
+*
+* Causal integration
+*
+****************************************************************/
+
+/*
+trace[nt] - input/output vector of causally integrated trace
+*/
+void sf_ktmig_cint(float *trace, const unsigned int nt)
+/*< Causal integration >*/
+{
+	int i;
+
+	for (i = 1; i < nt; i++)
+		trace[i] += trace[i - 1];
+}
+
+/****************************************************************
+*
+* Anti-causal integration
+*
+****************************************************************/
+
+/*
+trace[nt] - input/output vector of anti-causally integrated trace
+*/
+void sf_ktmig_acint(float *trace, const unsigned int nt)
+/*< Anti-causal integration >*/
+{
+	int i;
+
+	for (i = nt - 2; i >= 0; i--)
+		trace[i] += trace[i + 1];
+}
+
+#define INTSMP(t, i) ((1.f - i + (float)((int)i))*t[(int)i] + (i - (float)((int)i))*t[(int)(i) + 1])
+
+
+/****************************************************************
+*
+* PSTM kernel with anti-aliasing after Lumley-Claerbout
+*
+****************************************************************/
+
+/*
+trace[int] - input trace
+vrms[ont]  - RMS velocity vector at image location,
+image[ont] - output image vector at the same location,
+ox         - image coordinate in x,
+oy         - image coordinate in y,
+sx         - source coordinate in x,
+sy         - source coordinate in y,
+gx         - receiver coordinate in x,
+gy         - receiver coordinate in y,
+nt         - number of input samples,
+ont        - number of output samples,
+ot         - value of t0 in input,
+dt         - sample rate of input,
+oot        - value of t0 in output,
+odt        - sample rate of output,
+trm        - maximum AA filter length,
+trf        - trace factor for AA filter
+aa         - antialiasing (true/false)
+*/
+void sf_ktmig_kernel(float *trace, float *vrms, float *image, float *stk,
+	const float ox, const float oy,
+	const float sx, const float sy,
+	const float gx, const float gy,
+	const unsigned int nt, const unsigned int ont,
+	const float ot, const float dt,
+	const float oot, const float odt,
+	const unsigned int trm, const float trf, float angmax, int t_b, int t_e,
+	int id, int trace2, float dis_aper,int aa)
+	/*< PSTM kernel with anti-aliasing after Lumley-Claerbout >*/
+{
+	float v, inv;
+	float inv2trf, nf;
+	int k;
+	float j, scale, smp, so2, go2;
+	float depth2, dx, dy, ts, tg;
+	float ang = 0;
+	float dis_max;
+	float cx, cy, dis_ang;
+	float factors = 0;
+	/* Loop over tau indices */
+	for (k = t_b; k < t_e; k++) {
+		/* RMS velocity at image location */
+		v = vrms[k];
+		/* Slowness at image location */
+		inv = 1.0f / v;
+		inv2trf = trf*inv*inv;
+		depth2 = powf(0.5f*v*(oot + k*odt), 2.0f);
+		dis_max = tan((angmax + 10) / 180 * 3.1415926535)*v*(oot + k*odt) / 2;
+		cx = (sx + gx) / 2;
+		cy = (gy + sy) / 2;
+		dis_ang = sqrtf((ox - cx)* (ox - cx) + (oy - cy)*(oy - cy));
+		/* squared distance to source from the image point on the surface */
+		so2 = (sx - ox)*(sx - ox) + (sy - oy)*(sy - oy);
+		/* squared distance to source from the image point on the surface */
+		go2 = (gx - ox)*(gx - ox) + (gy - oy)*(gy - oy);
+		//if(k==700) warn("max= %f   ang=%f  \n",dis_max,dis_ang);
+		if (dis_max>dis_ang && dis_ang<dis_aper)
+		{
+			/* Time from source to image point in pseudodepth */
+			ts = sqrtf(so2 + depth2)*inv;
+			/* Time from receiver to image point in pseudodepth */
+			tg = sqrtf(go2 + depth2)*inv;
+			/* double root square time = time to source + time to receiver */
+			ang = 180.0 / 3.1415926535*fabs(acos((oot + k*odt) / (ts + tg)));
+			j = (ts + tg - ot) / dt; /* Input sample index */
+			factors = 0.0;
+			if (ang <= angmax) factors = 1.0;
+			if (aa == 0) {
+				if (j >= 0.f && j < nt)
+				{
+					image[k] += INTSMP(trace, j)*factors;
+					if (INTSMP(trace, j)*factors != 0.0) stk[k] += 1.0;
+				}
+				continue;
+			}
+			//warn("csdfsdfsdfsdfsdfsdf \n");
+			/* (distance to source.x)/(time to source) + (distance to receiver.x)/(time to receiver) */
+			dx = (sx - ox) / ts + (gx - ox) / tg;
+			/* (distance to source.y)/(time to source) + (distance to receiver.y)/(time to receiver) */
+			dy = (sy - oy) / ts + (gy - oy) / tg;
+			/* Filter length */
+			nf = inv2trf*sqrtf(dx*dx + dy*dy);
+			/* Truncate filter */
+			if (nf > trm)
+				nf = (float)trm;
+			/* Check ranges */
+			if ((j - nf - 1.0f) >= 0.0f && (j + nf + 1.0f) < nt)
+			{
+				/* Scaling factor */
+				scale = 1.0f / (1.0f + nf);
+				scale *= scale;
+				/* Collect samples */
+				smp = 2.0f*INTSMP(trace, j)
+					- INTSMP(trace, (j - nf - 1.0f))
+					- INTSMP(trace, (j + nf + 1.0f));
+				/* Contribute to the image point */
+				image[k] += scale*smp*factors;
+				if (fabs(scale*smp*factors) >0.0) { stk[k] += 1; }
+			}
+		}
+
+	}
+}
+
+
+
+/****************************************************************
+*
+* PSTM kernel with anti-aliasing after Lumley-Claerbout
+*
+****************************************************************/
+
+/*
+trace[int] - input trace
+vrms[ont]  - RMS velocity vector at image location,
+image[ont] - output image vector at the same location,
+ox         - image coordinate in x,
+oy         - image coordinate in y,
+sx         - source coordinate in x,
+sy         - source coordinate in y,
+gx         - receiver coordinate in x,
+gy         - receiver coordinate in y,
+nt         - number of input samples,
+ont        - number of output samples,
+ot         - value of t0 in input,
+dt         - sample rate of input,
+oot        - value of t0 in output,
+odt        - sample rate of output,
+trm        - maximum AA filter length,
+trf        - trace factor for AA filter
+aa         - antialiasing (true/false)
+*/
+__global__ void cuda_kirchhoff_pstm(float *t, float *vrms, float *image, float *stk,
+	float2 *sxy, float2 *gxy, float2 *ixy,
+	int ntrace, int nt, int ncdp,
+	float dis_aper, float angmax,
+	float dt,
+	int t_b,
+	int aa)
+	/*< PSTM kernel with anti-aliasing after Lumley-Claerbout >*/
+{
+	int i1 = blockIdx.x*blockDim.x + threadIdx.x + t_b;
+	int i2 = blockIdx.y*blockDim.y + threadIdx.y;
+	int id = i1 + i2*nt;
+	float v, inv;
+	float inv2trf, nf;
+	int k;
+	float j, scale, smp, so2, go2;
+	float depth2, dx, dy, ts, tg;
+	float ang = 0;
+	float dis_max;
+	float sx, sy, gx, gy, cx, cy, ox, oy, dis_ang;
+	float factors = 0;
+	int itrace;
+	float temp;
+	for (itrace = 0; itrace < ntrace; itrace++)
+	{
+		if (i1 < nt  && i2 < ncdp)
+		{
+			v = vrms[id];
+			inv = 1.0f / v;
+			depth2 = powf(0.5f*v*(i1*dt), 2.0f);
+			dis_max = tan((angmax + 10) / 180 * 3.1415926535)*v*(i1*dt) / 2;
+			sx = sxy[itrace].x;
+			sy = sxy[itrace].y;
+			gx = gxy[itrace].x;
+			gy = gxy[itrace].y;
+			cx = (sxy[itrace].x + gxy[itrace].x) / 2;
+			cy = (sxy[itrace].y + gxy[itrace].y) / 2;
+			ox = ixy[i2].x;
+			oy = ixy[i2].y;
+			dis_ang = sqrtf((ox - cx)* (ox - cx) + (oy - cy)*(oy - cy));
+			so2 = (sx - ox)*(sx - ox) + (sy - oy)*(sy - oy);
+			go2 = (gx - ox)*(gx - ox) + (gy - oy)*(gy - oy);
+			if (dis_max > dis_ang && dis_ang < dis_aper)
+			{
+				ts = sqrtf(so2 + depth2)*inv;
+				tg = sqrtf(go2 + depth2)*inv;
+				ang = 180.0 / 3.1415926535*fabs(acos((i1*dt) / (ts + tg)));
+				j = (ts + tg) / dt; /* Input sample index */
+				factors = 0.0;
+				if (ang <= angmax) factors = 1.0;
+				else { factors = cos((ang - angmax)*PI / 23); }
+				if (j >= 0.f && j < nt)
+				{
+					//INTSMP(t, i) ((1.f - i + (float)((int)i))*t[(int)i] + (i - (float)((int)i))*t[(int)(i)+1])
+					//image[k] += INTSMP(trace, j)*factors;
+					temp = ((1.f - j + (float)((int)j))*t[(int)j + itrace*nt] + (j - (float)((int)j))*t[(int)(j)+1 + itrace*nt]);
+					image[id] += temp*factors;
+					if (temp*factors != 0.0) stk[id] += 1.0;
+				}
+			}
+		}// i1 and i2
+
+	}//  itrace
+}
+
+
+
+
+
+
+void stacking(float *imag, float *stk, float *img2, int osize)
+{
+
+	int i, j, k;
+	for (i = 0; i<osize; i++)
+		if (stk[i]>30)  img2[i] = imag[i] / stk[i];
+
+}
+
+///////////////////////////////////////////////KTMIG
+segy intrace; 	/* input traces */
+segy vol;	/* migrated output traces */
+int main(int argc, char* argv[]) {
+	/* Counters */
+	int i = 0, j = 0, k = 0, l, n, iit;
+
+	/* Input data parameters */
+	int nt, nx, ny = 1, nix = 1, nin = 1, osize, ntr, btr, dbtr;
+	float ot, dt;
+
+	/* Apperture parameters */
+	int ix, iy, minix, miniy, maxix, maxiy;
+	/* Apperture half-width in each direction */
+	int apx, apy;
+	/* Apperture first indices in x,y and number of x,y locations */
+	int aox, aoy, anx, any;
+
+	/* Image(output) space parameters */
+	int ont, onx, ony;
+	float oot, oox, ooy;
+	float odt, odx, ody;
+
+	/* Antialias filter parameters */
+	int maxtri;
+	float trfact, trm;
+
+	/* Aperture corners */
+	int el_cx1, el_cx2, el_cy1, el_cy2;
+	int blk_y;
+	float el_x, el_y;
+
+	/* Input traces, output image, velocity */
+	float *t, *img, *v, *v_slice, *stk, *img2;
+	/* Aperture indices */
+	int *ap;
+	/* Coordinates: shot, receiver, and midpoint */
+
+	int star_line, nline, ncdp, all_line, id, index_trace, t_b, t_e;
+	int oidx, nntt;
+	float dis_aper;
+	int y_b, y_e;
+	float angmax = 0;
+	float ox, oy, sx, sy, gx, gy;
+	char *vrmsfile, *imgfile;
+	//sf_file data, image, vrms, sxsy, gxgy, cxcy;
+	FILE *fp_vfile = NULL;
+	FILE *fp_image = NULL;
+	initargs(argc, argv);
+	requestdoc(0);
+
+
+
+
+
+
+	if (!getparfloat("aper", &dis_aper)) err("can't get ooy in aper");
+	if (!getparint("t_b", &t_b)) err("can't get t_b");
+	if (!getparint("t_e", &t_e)) err("can't get t_e");
+	if (!getparint("nntt", &nntt)) err("can't get nntt");
+	if (!getparint("group", &nx)) err("can't get group");
+	if (!getparint("star_line", &star_line)) err("can't get star_line");
+	if (!getparint("id", &id)) err("can't get id");
+	if (!getparint("all_line", &all_line)) err("can't get all_line");
+	if (!getparint("ncdp", &ncdp)) err("can't get ncdp");
+	if (!getparint("nline", &nline)) err("can't get nline");
+	if (!getparfloat("dx", &odx)) err("can't get odx in celocity");
+	if (!getparfloat("angmax", &angmax)) err("can't get angmax");
+	if (!getparfloat("dy", &ody)) err("can't get dy in velocity");
+	if (!getparfloat("x_beg", &oox)) err("can't get oox in celocity");
+	if (!getparfloat("y_beg", &ooy)) err("can't get ooy in velocity");
+	if (!getparstring("vfile", &vrmsfile)) { warn("error infile vrm"); }
+	if (!getparstring("image", &imgfile)) { warn("error outfile image"); }
+	if ((fp_vfile = fopen(vrmsfile, "r")) == NULL)
+		err("cannot open infile=%s\n", vrmsfile);
+	if ((fp_image = fopen(imgfile, "wb")) == NULL)
+		err("cannot open infile=%s\n", imgfile);
+
+	cudaSetDevice(id);// initialize device, default device=0;
+	sf_check_gpu_error("Failed to initialize device!");
+	dim3 dimg, dimb;
+
+
+
+	fgettr(fp_vfile, &vol);
+	int  aa, diff;
+	float *d_t, *d_v, *d_img, *d_stk;
+	float2  *sxy, *gxy, *ixy;
+	float2 *d_sxy, *d_gxy, *d_ixy;
+
+
+	int devcnt = 0;
+	if (!getparint("aa", &aa)) aa = 1;
+	if (!getparint("diff", &diff)) diff = 1;
+	gettr(&intrace);
+	nt = intrace.ns;
+	ny = 1;
+	nin = 1;
+	nix = 1;
+	ntr = nx;
+	dt = 0.004;
+	ot = 0.0;
+	ont = nt;
+	onx = nline;
+	ony = ncdp;
+	osize = nt*ncdp;
+	odt = dt;
+	oot = 0.;
+	warn("Image size: %d x %d x %d   nt=%d   dt=%f", ont, onx, ony, nt, dt);
+	btr = ntr;
+	warn("Setting number of traces per block to %d", btr);
+	if (!getparint("maxtri", &maxtri)) maxtri = 13;
+	if (!getparfloat("trfact", &trfact)) trfact = 4.0*(0.5*(odx + ody) / dt);
+
+
+	/* Initiate output */
+	v_slice = (float*)malloc(ncdp*ont * sizeof(float));
+	v = (float*)malloc(osize * sizeof(float));
+	img = (float*)malloc(osize * sizeof(float));
+	img2 = (float*)malloc(osize * sizeof(float));
+	stk = (float*)malloc(osize * sizeof(float));
+	memset(stk, 0, sizeof(float)*osize);
+	memset(img2, 0, sizeof(float)*osize);
+	//for (i = 0; i < all_line; i++)
+	{
+		for (j = 0; j < ncdp; j++)
+		{
+			fgettr(fp_vfile, &vol);
+			//if (i >= star_line && i < star_line + nline)
+			{
+				for (iit = 0; iit < nt; iit++)
+				{
+					v[j*nt + iit] = vol.data[iit];
+				}
+			}
+		}
+	}
+	//warn("Setting velocity");
+	t = (float*)malloc(btr*nt * sizeof(float));
+	sxy = (float2*)malloc(btr * sizeof(float2));
+	gxy = (float2*)malloc(btr * sizeof(float2));
+	ixy = (float2*)malloc(ncdp * sizeof(float2));
+	for (i = 0; i < ncdp; i++)
+	{
+		ixy[i].x = star_line*odx + oox;
+		ixy[i].y = i*ody + ooy;
+	}
+
+	cudaMalloc(&d_stk, osize * sizeof(float));
+	cudaMalloc(&d_img, osize * sizeof(float));
+	cudaMalloc(&d_v, osize * sizeof(float));
+	cudaMalloc(&d_t, btr * nt * sizeof(float));
+	cudaMalloc(&d_sxy, btr * sizeof(float2));
+	cudaMalloc(&d_gxy, btr * sizeof(float2));
+	cudaMalloc(&d_ixy, ncdp * sizeof(float2));
+
+	cudaMemset(d_stk, 0, osize * sizeof(float));
+	cudaMemset(d_img, 0,  osize * sizeof(float));
+	cudaMemset(d_v, 0, osize * sizeof(float));
+	cudaMemset(d_t, 0, btr * nt * sizeof(float));
+	cudaMemset(d_sxy, 0, btr * sizeof(float2));
+	cudaMemset(d_gxy, 0, btr * sizeof(float2));
+	cudaMemset(d_ixy, 0, ncdp * sizeof(float2));
+
+	cudaMemcpy(d_ixy, ixy, ncdp * sizeof(float2), cudaMemcpyHostToDevice);
+	cudaMemcpy(d_v, v, ncdp *nt* sizeof(float), cudaMemcpyHostToDevice);
+
+	sf_check_gpu_error("Failed to initialize device memory!");
+	/* Loop over input traces */
+	dim3 dimg, dimb;
+	dimg.x = (nt + BlockSize1 - 1) / BlockSize1;
+	dimg.y = (ncdp + BlockSize2 - 1) / BlockSize2;
+	dimb.x = BlockSize1;
+	dimb.y = BlockSize2;
+
+
+
+	/* Migration */
+	i = 0;
+	do
+	{
+		for (j = 0; j<nt; j++)   t[i*nt + j] = intrace.data[j];
+		sxy[i].x = 1.0*intrace.sx;
+		sxy[i].y = 1.0*intrace.sy;
+		gxy[i].x = 1.0*intrace.gx;;
+		gxy[i].x = 1.0*intrace.gx;;
+		i++;
+		if (i == btr)
+		{
+			cudaMemcpy(d_t, t, nt*btr * sizeof(float), cudaMemcpyHostToDevice);
+			cudaMemcpy(d_sxy, sxy, btr * sizeof(float2), cudaMemcpyHostToDevice);
+			cudaMemcpy(d_gxy, gxy, btr * sizeof(float2), cudaMemcpyHostToDevice);
+			
+			cuda_kirchhoff_pstm<<<dimg,dimb>>>(d_t, d_v, d_img, d_stk,
+				d_sxy, d_gxy, d_ixy,
+				btr, nt, ncdp,
+				dis_aper, angmax,
+				dt,
+				t_b,
+				aa);
+			sf_check_gpu_error("Failed to PSTM_kernel!");
+
+			warn("Migration cdpt %d \n ", intrace.cdpt);
+			cudaMemcpy(img, d_img, ncdp *nt * sizeof(float), cudaMemcpyDeviceToHost);
+			cudaMemcpy(stk, d_stk, ncdp *nt * sizeof(float), cudaMemcpyDeviceToHost);
+			stacking(img, stk, img2, osize);
+			fseek(fp_image, 0L, SEEK_SET);
+			fwrite(img2, sizeof(float), osize, fp_image);
+			i = 0;
+		}
+
+	} while (gettr(&intrace) && intrace.cdpt<nntt);
+	FILE *fp_v;
+	fp_v = fopen("v.bin", "wb");
+	fwrite(img, sizeof(float), osize, fp_v);
+	exit(0);
+}
