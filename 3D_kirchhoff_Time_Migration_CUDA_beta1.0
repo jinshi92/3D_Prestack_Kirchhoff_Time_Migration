@@ -1,9 +1,7 @@
-/* Prestack kirchoff time migration (2-D/3-D). */
-/*
-Chinese Academy of Science, Guiting Chen 2019.01.010
+/* Prestack kirchoff time migration (2-D/3-D). 
+Author: Chinese Academy of Science, Guiting Chen 2019.01.010
+Email:  chenguiting15@mails.ucas.ac.cn
 */
-
-
 #include "su.h"
 #include "segy.h"
 #include "header.h"
@@ -14,29 +12,15 @@ Chinese Academy of Science, Guiting Chen 2019.01.010
 #include <time.h>
 #include <cuda_runtime_api.h>
 #include <cuda.h>
-
 #define BlockSize1 	16// tile size in 1st-axis
 #define BlockSize2 	16// tile size in 2nd-axis
 
-			   /* Array of shot coordinates for input traces */
-
-/**************************************************************
-*
-* Differentiation (backward second order) kernel
-*
-***************************************************************/
-
-/*
-t[gridDim.x*c_nt] - output vector of differentiated traces,
-also input
-*/
 char *sdoc[] = {
 	" 								",
-	" 3D ktmig with high performance GPU acceleration	",
-	"	Author: Guiting Chen, Chinese Academy of Science,2018.12.09	",
+	" 3D Kirchhoff time migration with a high performance GPU acceleration	",
+	"	Author: Guiting Chen, Chinese Academy of Science",
 	"								",
 	NULL };
-
 
 void sf_check_gpu_error(const char *msg)
 /*< check GPU errors >*/
@@ -48,33 +32,11 @@ void sf_check_gpu_error(const char *msg)
 	}
 }
 
-
 /****************************************************************
 *
-* PSTM kernel with anti-aliasing after Lumley-Claerbout
+* PSTM kernel with anti-aliasing 
 *
 ****************************************************************/
-
-/*
-trace[int] - input trace
-vrms[ont]  - RMS velocity vector at image location,
-image[ont] - output image vector at the same location,
-ox         - image coordinate in x,
-oy         - image coordinate in y,
-sx         - source coordinate in x,
-sy         - source coordinate in y,
-gx         - receiver coordinate in x,
-gy         - receiver coordinate in y,
-nt         - number of input samples,
-ont        - number of output samples,
-ot         - value of t0 in input,
-dt         - sample rate of input,
-oot        - value of t0 in output,
-odt        - sample rate of output,
-trm        - maximum AA filter length,
-trf        - trace factor for AA filter
-aa         - antialiasing (true/false)
-*/
 __global__ void cuda_kirchhoff_pstm(float *t, float *vrms, float *image, float *stk,
 	float2 *sxy, float2 *gxy, float2 *ixy,
 	float ooy, float dy,
@@ -83,9 +45,7 @@ __global__ void cuda_kirchhoff_pstm(float *t, float *vrms, float *image, float *
 	int ntrace, int nt, int ncdp,
 	float dis_aper, float angmax,float in_ang,
 	float dt,
-	int t_b,
-	int aa)
-	/*< PSTM kernel with anti-aliasing after Lumley-Claerbout >*/
+	int t_b
 {
 	int i1 = blockIdx.x*blockDim.x + threadIdx.x ;
 	int i2 = blockIdx.y*blockDim.y + threadIdx.y;
@@ -120,7 +80,6 @@ __global__ void cuda_kirchhoff_pstm(float *t, float *vrms, float *image, float *
 			oy = ixy[i2].y;
 			imm=(int)((cy-ooy)/dy);
 			v = vrms[imm*nt+i1]*scales;
-			//v=vrms[id]*scales;
 			v2=vrms[id];
 			inv2=1.0f/v2;
 			inv = 1.0f / v;
@@ -133,75 +92,52 @@ __global__ void cuda_kirchhoff_pstm(float *t, float *vrms, float *image, float *
 			go2 = (gx - ox)*(gx - ox) + (gy - oy)*(gy - oy);
 			dis_tans=sqrtf(so2);
 			dis_tang=sqrtf(go2);
-
 			a_x=sx-ox;
 			a_y=sy-oy;
 			a_z=-0.5f/1*(vrms[i1])*scales*(i1*dt);
-
 			b_x=gx-ox;
 			b_y=gy-oy;
 			b_z=a_z;
-//
-		        coss=180/PI*acos(    (a_x*b_x+a_y*b_y+a_z*b_z)   /    (     sqrtf(a_x*a_x+a_y*a_y +a_z*a_z)*sqrtf(b_x*b_x+b_y*b_y +b_z*b_z)    )     );
-
-//&& coss< cos( in_ang/90*PI )   && dis_tans/depth1<sin(in_ang/180*PI) && dis_tang/depth1<sin(in_ang/180*PI) && coss< in_ang*2    180/PI*acos  && coss< in_ang*2   && atan(dis_so/depth1)*180/PI<in_ang     && dis_tans/depth1<tan(in_ang/180*PI) && dis_tang/depth1<tan(in_ang/180*PI)  && dis_ang < dis_aper  && dis_tans/depth1<tan(in_ang/180*PI) && dis_tang/depth1<tan(in_ang/180*PI) && tansg<2*in_ang
- 
-			
-			//ts=2*sqrtf(dis_so + depth2)*inv;
-			//j = (ts) / dt;
-				tansg=180/PI*(atan(dis_tang/depth1)+atan(dis_tans/depth1));
-			if(dis_tang>=dis_sg) tansg=180/PI*(atan(dis_tang/depth1)-atan(dis_tans/depth1));
-			if(dis_tans>=dis_sg) tansg=180/PI*(atan(dis_tans/depth1)-atan(dis_tang/depth1));
-			
-			//if(ox>sx &&ox<gx)
-			//if(j >= 4.f && j < nt-4){
-			//t[(int)(j)+itrace*nt]=0;
-			//t[(int)(j)+1+itrace*nt]=0; }
+		    coss=180/PI*acos(    (a_x*b_x+a_y*b_y+a_z*b_z)   /    (     sqrtf(a_x*a_x+a_y*a_y +a_z*a_z)*sqrtf(b_x*b_x+b_y*b_y +b_z*b_z)    )     );
+			//tansg=180/PI*(atan(dis_tang/depth1)+atan(dis_tans/depth1));
+			//if(dis_tang>=dis_sg) tansg=180/PI*(atan(dis_tang/depth1)-atan(dis_tans/depth1));
+			//if(dis_tans>=dis_sg) tansg=180/PI*(atan(dis_tans/depth1)-atan(dis_tang/depth1));
+		
 			if (dis_ang < dis_max && dis_ang < dis_aper   && coss< 70*2   && dis_tans/depth1<tan(in_ang/180*PI) && dis_tang/depth1<tan(in_ang/180*PI) )
 			{
 				ts = sqrtf(so2 + depth2)*inv;
 				tg = sqrtf(go2 + depth2)*inv;
-				ang = 180.0 / 3.1415926535*fabs(acos((i1*dt) / (ts + tg)));
 				j = (ts + tg) / dt; 
-				factors = 0.0;
-				if (ang <= 60) factors = 1.0;
-				else { factors = 0; }
 				if (j >= 4.f && j < nt-4)
 				{
-					//INTSMP(t, i) ((1.f - i + (float)((int)i))*t[(int)i] + (i - (float)((int)i))*t[(int)(i)+1])
-					//image[k] += INTSMP(trace, j)*factors;
-					//if(  dis_so/(j*dt/2*v) <sin(in_ang*PI/180)  )
-{
-// anti-aliasing
-j=j-3;
-temp1=((1.f - j + (float)((int)j))*t[(int)j + itrace*nt] + (j - (float)((int)j))*t[(int)(j)+1 + itrace*nt]);
-j=j+1;
-temp2=((1.f - j + (float)((int)j))*t[(int)j + itrace*nt] + (j - (float)((int)j))*t[(int)(j)+1 + itrace*nt]);
-j=j+1;
-temp3=((1.f - j + (float)((int)j))*t[(int)j + itrace*nt] + (j - (float)((int)j))*t[(int)(j)+1 + itrace*nt]);
-j=j+1;
-temp = ((1.f - j + (float)((int)j))*t[(int)j + itrace*nt] + (j - (float)((int)j))*t[(int)(j)+1 + itrace*nt]);
-j=j+1;
-temp4=((1.f - j + (float)((int)j))*t[(int)j + itrace*nt] + (j - (float)((int)j))*t[(int)(j)+1 + itrace*nt]);
-j=j+1;
-//temp5=((1.f - j + (float)((int)j))*t[(int)j + itrace*nt] + (j - (float)((int)j))*t[(int)(j)+1 + itrace*nt]);
-j=j+1;
-//temp6=((1.f - j + (float)((int)j))*t[(int)j + itrace*nt] + (j - (float)((int)j))*t[(int)(j)+1 + itrace*nt]);
+					// anti-aliasing
+					j=j-3;
+					temp1=((1.f - j + (float)((int)j))*t[(int)j + itrace*nt] + (j - (float)((int)j))*t[(int)(j)+1 + itrace*nt]);
+					j=j+1;
+					temp2=((1.f - j + (float)((int)j))*t[(int)j + itrace*nt] + (j - (float)((int)j))*t[(int)(j)+1 + itrace*nt]);
+					j=j+1;
+					temp3=((1.f - j + (float)((int)j))*t[(int)j + itrace*nt] + (j - (float)((int)j))*t[(int)(j)+1 + itrace*nt]);
+					j=j+1;
+					temp = ((1.f - j + (float)((int)j))*t[(int)j + itrace*nt] + (j - (float)((int)j))*t[(int)(j)+1 + itrace*nt]);
+					j=j+1;
+					temp4=((1.f - j + (float)((int)j))*t[(int)j + itrace*nt] + (j - (float)((int)j))*t[(int)(j)+1 + itrace*nt]);
+					j=j+1;
+					//temp5=((1.f - j + (float)((int)j))*t[(int)j + itrace*nt] + (j - (float)((int)j))*t[(int)(j)+1 + itrace*nt]);
+					j=j+1;
+					//temp6=((1.f - j + (float)((int)j))*t[(int)j + itrace*nt] + (j - (float)((int)j))*t[(int)(j)+1 + itrace*nt]);
+					tt1=0.5f*(3.0f*temp - 4.0f*temp3 + temp2) / dt;
+					tt2=0.5f*(3.0f*temp3 - 4.0f*temp2 + temp1) / dt;
+					temp4=0.5f*(3.0f*temp4 - 4.0f*temp + temp3) / dt;
+					temp=tt1;
+					temp3=tt2;
 
-
-tt1=0.5f*(3.0f*temp - 4.0f*temp3 + temp2) / dt;
-tt2=0.5f*(3.0f*temp3 - 4.0f*temp2 + temp1) / dt;
-temp4=0.5f*(3.0f*temp4 - 4.0f*temp + temp3) / dt;
-temp=tt1;
-temp3=tt2;
-
-
-					//image[id]=atan(dis_so/depth1)*180/PI;
-					 image[id] += (temp3+temp+temp4)*factors/3;
+					 image[id] += (temp3+temp+temp4)/3;
 					//image[id] += (temp2+temp3+temp+temp4+temp5)/5;
 					//image[id] += (temp1+temp2+temp3+temp+temp4+temp5+temp6)*factors/7;
-					//image[id] = ox;
-					if (temp != 0.0) stk[id] += 1.0;
+
+					if (temp != 0.0) stk[id] += 1.0;   	/* Counters */
+				}
+			}
 		}// i1 and i2
 	}//  itrace
 }
@@ -218,41 +154,20 @@ void stacking(float *imag, float *stk, float *img2, int osize)
 
 ///////////////////////////////////////////////KTMIG
 segy intrace; 	/* input traces */
-segy vol;	/* migrated output traces */
 int main(int argc, char* argv[]) {
-	/* Counters */
+
 	int i = 0, j = 0, k = 0, l, n, iit;
 
-	/* Input data parameters */
 	int nt, nx, ny = 1, nix = 1, nin = 1, osize, ntr, btr, dbtr;
 	float ot, dt;
 
-	/* Apperture parameters */
 	int ix, iy, minix, miniy, maxix, maxiy;
-	/* Apperture half-width in each direction */
 	int apx, apy;
-	/* Apperture first indices in x,y and number of x,y locations */
 	int aox, aoy, anx, any;
-
-	/* Image(output) space parameters */
 	int ont, onx, ony;
 	float oot, oox, ooy;
 	float odt, odx, ody;
-
-	/* Antialias filter parameters */
-	int maxtri;
-	float trfact, trm;
-
-	/* Aperture corners */
-	int el_cx1, el_cx2, el_cy1, el_cy2;
-	int blk_y;
-	float el_x, el_y;
-
-	/* Input traces, output image, velocity */
 	float *t, *img, *v, *v_slice, *stk, *img2;
-	/* Aperture indices */
-	int *ap;
-	/* Coordinates: shot, receiver, and midpoint */
 
 	int star_line, nline, ncdp, all_line, id, index_trace, t_b, t_e;
 	int oidx, nntt;
@@ -263,7 +178,7 @@ int main(int argc, char* argv[]) {
 	float scales=0;
 	float ox, oy, sx, sy, gx, gy;
 	char *vrmsfile, *imgfile;
-	//sf_file data, image, vrms, sxsy, gxgy, cxcy;
+
 	FILE *fp_vfile = NULL;
 	FILE *fp_image = NULL;
 	initargs(argc, argv);
@@ -276,7 +191,6 @@ int main(int argc, char* argv[]) {
 	if (!getparint("group", &nx)) err("can't get group");
 	if (!getparint("star_line", &star_line)) err("can't get star_line");
 	if (!getparint("id", &id)) err("can't get id");
-	if (!getparint("all_line", &all_line)) err("can't get all_line");
 	if (!getparint("ncdp", &ncdp)) err("can't get ncdp");
 	if (!getparint("nline", &nline)) err("can't get nline");
 	if (!getparfloat("dx", &odx)) err("can't get odx in celocity");
@@ -291,7 +205,7 @@ int main(int argc, char* argv[]) {
 	if ((fp_image = fopen(imgfile, "wb")) == NULL)
 		err("cannot open infile=%s\n", imgfile);
 
-	cudaSetDevice(id);// initialize device, default device=0;
+	cudaSetDevice(id);// initialize device
 	sf_check_gpu_error("Failed to initialize device!");
 
 	int  aa, diff;
@@ -301,9 +215,6 @@ int main(int argc, char* argv[]) {
 	float2 *d_sxy, *d_gxy, *d_ixy;
 
 
-	int devcnt = 0;
-	if (!getparint("aa", &aa)) aa = 1;
-	if (!getparint("diff", &diff)) diff = 1;
 	gettr(&intrace);
 	nt = intrace.ns;
 	ny = 1;
@@ -320,10 +231,6 @@ int main(int argc, char* argv[]) {
 	oot = 0.;
 	warn("Image size: %d x %d x %d   nt=%d   dt=%f", ont, onx, ony, nt, dt);
 	btr = ntr;
-	warn("Setting number of traces per block to %d", btr);
-	if (!getparint("maxtri", &maxtri)) maxtri = 13;
-	if (!getparfloat("trfact", &trfact)) trfact = 4.0*(0.5*(odx + ody) / dt);
-	/* Initiate output */
 	v_slice = (float*)malloc(ncdp*ont * sizeof(float));
 	v = (float*)malloc(osize * sizeof(float));
 	img = (float*)malloc(osize * sizeof(float));
@@ -331,13 +238,9 @@ int main(int argc, char* argv[]) {
 	stk = (float*)malloc(osize * sizeof(float));
 	memset(stk, 0, sizeof(float)*osize);
 	memset(img2, 0, sizeof(float)*osize);
-	fseek(fp_vfile, ncdp*nt*star_line, SEEK_SET);
-      //  for(i=0;i<=star_line;i++)
-	{
-		
-		fread(v,sizeof(float),ncdp*nt,fp_vfile);
+	fseek(fp_vfile, ncdp*nt*star_line, SEEK_SET);	
+	fread(v,sizeof(float),ncdp*nt,fp_vfile);
 
-	}
 	int si,sj,len;
 	if (!getparint("len", &len)) err("can't get len");
 	float *pen,tempv=0,sk,vmm;
@@ -364,7 +267,6 @@ int main(int argc, char* argv[]) {
 	}	
 	vmm=tempv/nt;
 	memcpy(v,v_slice,sizeof(float)*nt*ncdp);
-	//warn("Setting velocity");
 	t = (float*)malloc(btr*nt * sizeof(float));
 	sxy = (float2*)malloc(btr * sizeof(float2));
 	gxy = (float2*)malloc(btr * sizeof(float2));
@@ -397,13 +299,12 @@ int main(int argc, char* argv[]) {
 	cudaMemcpy(d_v, v, ncdp *nt* sizeof(float), cudaMemcpyHostToDevice);
 
 	sf_check_gpu_error("Failed to initialize device memory!");
-	/* Loop over input traces */
+
 	dim3 dimg, dimb;
 	dimg.x = (nt + BlockSize1 - 1) / BlockSize1;
 	dimg.y = (ncdp + BlockSize2 - 1) / BlockSize2;
 	dimb.x = BlockSize1;
 	dimb.y = BlockSize2;
-
 
     int itrace=0;
 	int imm;	
@@ -434,8 +335,8 @@ int main(int argc, char* argv[]) {
 				btr, nt, ncdp,
 				dis_aper, angmax,in_ang,
 				dt,
-				t_b,
-				aa);
+				t_b
+				);
 			sf_check_gpu_error("Failed to PSTM_kernel!");
 
 			warn("Migration cdpt %d  \n ", intrace.cdpt );
